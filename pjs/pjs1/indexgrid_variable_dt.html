@@ -1,0 +1,780 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>Moving Points in WebGL</title>
+<style>
+    label {
+        margin-left: 30px;
+    }
+</style>
+
+<script>
+
+"use strict";
+
+
+var vertexShaderSource =
+       "attribute vec2 a_coords;\n" +
+       "attribute vec3 a_color;\n" +
+       "varying vec3 v_color;\n" +
+       "uniform float u_pointsize;\n" +
+       "uniform float u_width;\n" +
+       "uniform float u_height;\n" +
+       "void main() {\n" +
+       "   float x = -1.0 + 2.0*(a_coords.x / u_width);\n" +
+       "   float y = 1.0 - 2.0*(a_coords.y / u_height);\n" +
+       "   gl_Position = vec4(x, y, 0.0, 1.0);\n" +
+       "   v_color = a_color;\n" +
+       "   gl_PointSize = u_pointsize;\n" +
+       "}\n";
+
+var fragmentShaderSource =
+       "precision mediump float;\n" +
+       "varying vec3 v_color;\n" +
+       "void main() {\n" +
+       "   float distanceFromCenter = distance( gl_PointCoord, vec2(0.5,0.5) );\n" +
+       "   if ( distanceFromCenter >= 0.5 ) {\n" +
+       "       discard;  // don't draw this pixel!\n" +
+       "   }\n" +
+       "   gl_FragColor = vec4(v_color, 1.0);\n" +
+       "}\n";
+
+var canvas;  // The canvas where WebGL draws.
+var gl;  // The WebGL graphics context.
+
+var uniformWidth;   // Location of uniform named "u_width"
+var uniformHeight;  // Location of uniform named "u_height"
+var uniformPointsize;   // Location of uniform named "u_pointsize" 
+
+var attributeCoords;  // Location of the attribute named "a_coords".
+var bufferCoords;     // A vertex buffer object to hold the values for coords.
+
+var attributeColor;   // Location of the attribute named "a_color".
+var bufferColor;     // A vertex buffer object to hold the values for color.
+
+
+/* Data for the points, including their coordinates, velocities and colors.
+   The values for the arrays are created during initialization.  The random
+   colors are used when the user selects colored rather than red points.
+   The positions of the points are updated for each frame of the animation. */
+
+const POINT_COUNT = 10;
+const POINT_SIZE = 16;
+const MASS = 1;
+const GRAVITY = 9.8;
+const DAMPING = 0.8;
+const GRIDCELLSIZE = 4*POINT_SIZE;
+//const DT = 1.0/60.0;
+let BORDERBC=false;
+let COLLISIONS=0;
+let simtime = 0;
+let frameRef = 0;
+let running = false;
+let currentTime;
+let frameTime;
+//let dt = 0.01;
+//let accumulator = 0.0;
+
+
+let pointID = new Int16Array( POINT_COUNT );
+let pointGrid = new Int16Array( POINT_COUNT );
+let pointMass = new Float32Array( POINT_COUNT );
+let pointCoords = new Float32Array( 2*POINT_COUNT );
+let pointVelocities = new Float32Array( 2*POINT_COUNT );
+let pointAccelerations = new Float32Array( 2*POINT_COUNT );
+let oldpointCoords = new Float32Array( 2*POINT_COUNT );
+let oldpointVelocities = new Float32Array( 2*POINT_COUNT );
+let oldpointAccelerations = new Float32Array( 2*POINT_COUNT );
+let pointForces = new Float32Array( 2*POINT_COUNT );
+let pointPotentialEnergy = new Float32Array( POINT_COUNT );
+let pointKyneticEnergy = new Float32Array( POINT_COUNT );
+let pointEnergy = new Float32Array( POINT_COUNT );
+
+
+function createPointData() { // called during initialization to fill the arrays with data.
+    for (let i = 0; i < POINT_COUNT; i++) {
+        pointMass[i] = MASS;
+        pointID[i] = i;        
+        // Each point has two coordinates and two velocities.  Velocity number k
+           // tells how fast coordinate number k changes in pixels per frame.
+        //pointCoords[2*i] = canvas.width * (i+1)/101;  // x-coordinate of point
+        //pointCoords[2*i+1] = canvas.height * 0.2;  // y-coordinate of point
+        pointCoords[2*i] = canvas.width * Math.random();  // x-coordinate of point
+        pointCoords[2*i+1] = canvas.height * Math.random();  // y-coordinate of point
+        //pointCoords[0] = 120;  // y-coordinate of point
+        //pointCoords[1] = 120;  // y-coordinate of point
+        //pointCoords[2] = 480;  // y-coordinate of point
+        //pointCoords[3] = 480;  // y-coordinate of point
+        
+        var randomVelocity = 1 + 30*Math.random();
+        var randomAngle = 2*Math.PI * Math.random();
+        pointVelocities[2*i] = randomVelocity*Math.cos(randomAngle);
+        pointVelocities[2*i+1] =  randomVelocity*Math.sin(randomAngle);
+        //pointVelocities[2*i] = 30;
+        //pointVelocities[2*i+1] = 10;
+        //pointVelocities[0] = 30;
+        //pointVelocities[1] = 30;
+        //pointVelocities[2] = -30;
+        //pointVelocities[3] = -30;
+        
+        updateAccelerations();
+        updateEnergies();
+    }
+    
+}
+
+function createGrid(){
+    let GridSize = Math.ceil(canvas.width/GRIDCELLSIZE)*Math.ceil(canvas.height/GRIDCELLSIZE);
+    let Grid = new Array(GridSize);
+
+    console.log(Grid.length);
+
+    for (let i = 0;i < Grid.length; i++)
+    {
+        Grid[i] = new Array();
+    }    
+    
+    
+    for (let i = 0; i < POINT_COUNT; i++) {
+        pointGrid[i] = Math.floor(pointCoords[2*i]/GRIDCELLSIZE)*Math.floor(pointCoords[2*i+1]/GRIDCELLSIZE);
+        console.log("Point " + i + " is on grid n°  " + pointGrid[i]);
+        Grid[pointGrid[i]].push(pointID[i]);
+    }  
+    console.table(Grid);
+
+    COLLISIONS = 0;
+    console.log("Before CheckCollisions:  " +Date.now());
+    for (let i = 0;i < Grid.length; i++)
+    {
+        if (Grid[i].length > 1){
+            for (let j = 0; j < Grid[i].length;j++ ){
+                for (let k=j+1; k < Grid[i].length;k++){
+                console.log("Checking collisions  " + Grid[i][j] + "  " + Grid[i][k]);
+                CheckCollisions(Grid[i][j],Grid[i][k])
+                }
+            }
+        }
+    }    
+}
+
+function updateForces(){
+  let i;
+
+  for (i = 0; i < POINT_COUNT; i++) {
+    pointForces[2*i] = 0;
+    pointForces[2*i+1] = GRAVITY;
+  }  
+}
+
+function updateAccelerations(){
+  let i;
+  
+  updateForces();
+  for (i = 0; i < POINT_COUNT; i++) {
+    pointAccelerations[2*i] = 0;
+    pointAccelerations[2*i+1] = pointForces[2*i+1]/pointMass[i];
+  }
+}
+
+function updateEnergies(){
+  let i;
+  
+  for (i = 0; i < POINT_COUNT; i++) {
+    pointPotentialEnergy[i]=pointMass[i]*GRAVITY*(-pointCoords[2*i+1]+canvas.height-POINT_SIZE);
+    //if (pointEnergies[2*i+1] < 0) {pointCoords[2*i+1]=canvas.height-POINT_SIZE;pointVelocities[2*i+1]=0;}
+  }
+}
+
+function CheckBorderBC(){
+  let size = POINT_SIZE/2; // radius
+  
+   
+    for (let i = 0; i < POINT_COUNT; i++) { 
+      
+        if (pointCoords[2*i] < 0 + size) {
+            pointCoords[2*i] = 0 + size;
+            pointVelocities[2*i] = -DAMPING*pointVelocities[2*i];// and make sure point is moV1ng in positive direction
+            BORDERBC = 1;
+        }
+        if (pointCoords[2*i] > canvas.width -size) {
+            pointCoords[2*i] = canvas.width -size;
+            pointVelocities[2*i] = -DAMPING*pointVelocities[2*i];// and make sure point is moV1ng in positive direction
+            BORDERBC = 1;
+        } 
+        if (pointCoords[2*i+1] < 0 + size) {
+            pointCoords[2*i+1] = 0 + size;
+            pointVelocities[2*i+1] = -DAMPING*pointVelocities[2*i+1]; // and make sure point is moV1ng in positive direction
+            BORDERBC = 1;
+        }
+        if ( pointCoords[2*i+1] > canvas.height - size) {
+            pointCoords[2*i+1] = canvas.height - size;
+            pointVelocities[2*i+1] = -DAMPING*pointVelocities[2*i+1]; // and make sure point is moV1ng in positive direction
+            BORDERBC = 1;
+        }
+      
+    }    
+}     
+    
+
+    
+
+
+function CheckCollisions(particlei, particlej){
+    let i=particlei;
+    let j=particlej;
+    let size = POINT_SIZE; // radius
+    
+    
+
+    //for (i = 0; i < POINT_COUNT; i++) {
+        
+          //for (j = i+1; j < POINT_COUNT; j++) {
+            
+                var dxi = pointCoords[2*i]-pointCoords[2*j];
+                var dyi = pointCoords[2*i+1]-pointCoords[2*j+1];
+                var dxj = pointCoords[2*j]-pointCoords[2*i];
+                var dyj = pointCoords[2*j+1]-pointCoords[2*i+1];
+                var distance = Math.sqrt(dxi**2 + dyi**2);
+                var V1 = Math.sqrt(pointVelocities[2*i]**2 + pointVelocities[2*i+1]**2);
+                var V2 = Math.sqrt(pointVelocities[2*j]**2 + pointVelocities[2*j+1]**2);
+
+                var vrelix = pointVelocities[2*i] - pointVelocities[2*j];
+                var vreliy = pointVelocities[2*i+1] - pointVelocities[2*j+1];
+
+                var vreljx = pointVelocities[2*j] - pointVelocities[2*i];
+                var vreljy = pointVelocities[2*j+1] - pointVelocities[2*i+1];
+
+                var theta = Math.atan2(pointCoords[2*j+1]-pointCoords[2*i+1],pointCoords[2*j]-pointCoords[2*i]);
+                
+                var m1=pointMass[i];
+                var m2=pointMass[j];
+
+                               
+                var V1angle = Math.atan2(pointVelocities[2*i+1],pointVelocities[2*i]);
+                var V2angle = Math.atan2(pointVelocities[2*j+1],pointVelocities[2*j]);
+
+                //console.log(i + "   " + j + "   " + dxi + "   " + dyi + "   " + distance + "   " + V1 + "   " + V2 + "   " + theta);
+
+                /*if (pointVelocities[2*i] == 0) {
+                    if (pointVelocities[2*i+1] > 0) {V1angle = Math.atan2(pointVelocities[2*i+1],pointVelocities[2*i]);}
+                    else  {V1angle = Math.atan2(pointVelocities[2*i+1],pointVelocities[2*i])- Math.PI;console.log(" Particula i velocidad X= 0 velocidad negativa Y");}
+                }
+                if (pointVelocities[2*i+1] == 0) {
+                    if (pointVelocities[2*i] > 0) {V1angle =  Math.atan2(pointVelocities[2*i+1],pointVelocities[2*i]);}
+                    else  {V1angle =  Math.atan2(pointVelocities[2*i+1],pointVelocities[2*i])- 1000;console.log(" Particula i velocidad Y= 0 velocidad negativa X");}
+                }
+                if (pointVelocities[2*j] == 0) {
+                    if (pointVelocities[2*j+1] > 0) {V2angle =  Math.atan2(pointVelocities[2*j+1],pointVelocities[2*j]);}
+                    else  {V2angle =  Math.atan2(pointVelocities[2*j+1],pointVelocities[2*j])- Math.PI;console.log(" Particula j velocidad X= 0 velocidad negativa Y");}
+                }
+                if (pointVelocities[2*j+1] == 0) {
+                    if (pointVelocities[2*j] > 0) {V2angle =  Math.atan2(pointVelocities[2*j+1],pointVelocities[2*j]);}
+                    else {V2angle =  Math.atan2(pointVelocities[2*j+1],pointVelocities[2*j])- 1000;console.log(" Particula j velocidad Y= 0 velocidad negativa X");}
+                }*/
+                
+                
+                                              
+                if (distance < size) { 
+                    
+                    /*pointCoords[2*i] += (size-distance)/2*Math.cos(theta);                 
+                    pointCoords[2*i+1] += (size-distance)/2*Math.sin(theta);
+                    pointCoords[2*j] += (size-distance)/2*Math.cos(theta);
+                    pointCoords[2*j+1] += (size-distance)/2*Math.sin(theta);*/
+                                     
+                   if(dxi < 0 && dyi <= 0){
+                        pointCoords[2*i] -= (size-distance)/2*Math.cos(theta);                 
+                        pointCoords[2*i+1] -= (size-distance)/2*Math.sin(theta);
+                        pointCoords[2*j] += (size-distance)/2*Math.cos(theta);
+                        pointCoords[2*j+1] += (size-distance)/2*Math.sin(theta);
+                    }
+
+                    if(dxi > 0 && dyi <= 0){
+                        pointCoords[2*i] += (size-distance)/2*Math.cos(theta);                 
+                        pointCoords[2*i+1] -= (size-distance)/2*Math.sin(theta);
+                        pointCoords[2*j] -= (size-distance)/2*Math.cos(theta);
+                        pointCoords[2*j+1] += (size-distance)/2*Math.sin(theta);
+                    }
+
+                    if(dxi <= 0 && dyi > 0){
+                        pointCoords[2*i] -= (size-distance)/2*Math.cos(theta);                 
+                        pointCoords[2*i+1] += (size-distance)/2*Math.sin(theta);
+                        pointCoords[2*j] += (size-distance)/2*Math.cos(theta);
+                        pointCoords[2*j+1] -= (size-distance)/2*Math.sin(theta);
+                    }
+
+                    if(dxi > 0 && dyi > 0){
+                        pointCoords[2*i] += (size-distance)/2*Math.cos(theta);                 
+                        pointCoords[2*i+1] += (size-distance)/2*Math.sin(theta);
+                        pointCoords[2*j] -= (size-distance)/2*Math.cos(theta);
+                        pointCoords[2*j+1] -= (size-distance)/2*Math.sin(theta);
+                    }
+                    
+                    /*pointVelocities[2*i]  = DAMPING*(-dxi*(dxi*vrelix + dyi*vreliy)/(distance**2));
+                    pointVelocities[2*i+1]  = DAMPING*(dyi*(dxi*vrelix + dyi*vreliy)/(distance**2));
+                    pointVelocities[2*j]  = DAMPING*(-dxj*(dxj*vreljx + dyi*vreljy)/(distance**2));
+                    pointVelocities[2*j+1]  = DAMPING*(dyj*(dxj*vreljx + dyi*vreljy)/(distance**2));*/
+
+                    /*pointVelocities[2*i]  = DAMPING*(V2*Math.cos(V2angle-theta)*Math.cos(theta)+V1*Math.sin(V1angle-theta)*Math.cos(theta+Math.PI/2));
+                    pointVelocities[2*i+1]  = DAMPING*(V2*Math.cos(V2angle-theta)*Math.sin(theta)+V1*Math.sin(V1angle-theta)*Math.sin(theta+Math.PI/2));
+                    pointVelocities[2*j]  = DAMPING*(V1*Math.cos(V1angle-theta)*Math.cos(theta)+V2*Math.sin(V2angle-theta)*Math.cos(theta+Math.PI/2));
+                    pointVelocities[2*j+1]  = DAMPING*(V1*Math.cos(V1angle-theta)*Math.sin(theta)+V2*Math.sin(V2angle-theta)*Math.sin(theta+Math.PI/2));*/
+                    
+                    
+                    //calculating the new x and y velocity in the new system of ball a and b
+
+                    var V1x=Math.cos(V1angle-theta)*V1;//V1x is the x velocity of ball a 
+                    var V2x=Math.cos(V2angle-theta)*V2;//V2x is the x velocity of ball b 
+
+
+
+
+                    var V1y=Math.sin(V1angle-theta)*V1;//V1y is the y velocity of ball a
+                    var V2y=Math.sin(V2angle-theta)*V2;//V2y is the y velocity of ball b
+
+
+
+
+                    ////////////////////////////////////////////////////////////////////////
+
+
+
+                    //calculating the final x and y velocity of the two balls after collision in the new system
+
+                    var U1x=((m1-m2)*V1x)/(m1+m2)+((2*m2))*V2x/(m1+m2);
+
+
+                    var U2x=((m2-m1)/(m1+m2))*V2x+((2*m1)/(m1+m2))*V1x;
+
+
+                    var U1y=((m1-m2)/(m1+m2))*V1y+((2*m2)/(m1+m2))*V2y;
+                    var U2y=((m2-m1)/(m1+m2))*V2y+(   (2*m1)/(m1+m2))*V1y;
+
+                     //////////////////////////////////////////////////////////////
+
+
+
+                    var U11x=U1x,U11y=U1y,U22x=U2x,U22y=U2y;
+
+
+                    //converting x and y velocity in the new rotated system back to the main system
+                    U1x=U11x*Math.cos(theta)+U11y*Math.cos(theta+Math.PI/2);
+                    U1y=U11x*Math.sin(theta)+U11y*Math.sin(theta+Math.PI/2);
+
+
+                    U2x=U22x*Math.cos(theta)+U22y*Math.cos(theta+Math.PI/2);
+                    U2y=U22x*Math.sin(theta)+U22y*Math.sin(theta+Math.PI/2);
+
+                    pointVelocities[2*i+1] = U1y;
+                    pointVelocities[2*j+1] = U2y;
+
+                    pointVelocities[2*i] = U1x;
+                    pointVelocities[2*j] = U2x;
+
+                    COLLISIONS += 1;
+
+                    dxi = pointCoords[2*i]-pointCoords[2*j];
+                    dyi = pointCoords[2*i+1]-pointCoords[2*j+1];
+                    dxj = pointCoords[2*j]-pointCoords[2*i];
+                    dyj = pointCoords[2*j+1]-pointCoords[2*i+1];
+                    distance = Math.sqrt(dxi**2 + dyi**2);
+                    V1 = Math.sqrt(pointVelocities[2*i]**2 + pointVelocities[2*i+1]**2);
+                    V2 = Math.sqrt(pointVelocities[2*j]**2 + pointVelocities[2*j+1]**2);
+
+                    //console.log(i + "   " + j + "   " + dxi + "   " + dyi + "   " + distance + "   " + V1 + "   " + V2 + "   " + theta);
+                    
+                    var out=document.getElementById("output3");
+                    out.innerHTML="Colision Particula " + i + "  Particula  "  + j + " :" + pointCoords[2*i] + "  " + pointCoords[2*i+1] + "  Angulo:  " + 180/Math.PI*theta + 
+                    "  Distancia" + distance + "   dxi  " + dxi + "   dyi  " + dyi + "  V1  " + V1 + "   V2  " + V2 + "  V1angle   " + 180/Math.PI*V1angle + "   V2angle  " + 180/Math.PI*V2angle ;
+                    
+                    
+                    
+                }
+                 
+           // }    
+          
+        
+    //}    
+    
+    
+}
+
+function integrateEuler(deltaTime){
+    let DT = deltaTime;
+  
+    let i,j;
+    
+    for (i = 0; i < 2*POINT_COUNT; i += 2) { // x-coords
+        pointCoords[i] += pointVelocities[i]*DT;
+        pointVelocities[i] += pointAccelerations[i]*DT;
+    }
+    for (i = 1; i < 2*POINT_COUNT; i += 2) { // y-coords
+        pointCoords[i] += pointVelocities[i]*DT;
+        pointVelocities[i] += pointAccelerations[i]*DT;
+    }
+
+   
+}
+
+function integrateVerlet(deltaTime){
+    let DT = deltaTime;
+  
+    let i;
+    
+    for (i = 0; i < 2*POINT_COUNT; i += 2) { // x-coords
+        pointCoords[i] += pointVelocities[i]*DT + 1/2*pointAccelerations[i]*DT*DT;
+        oldpointAccelerations[i]=pointAccelerations[i];
+        updateAccelerations();
+        pointVelocities[i] += 1/2*(oldpointAccelerations[i]*DT+pointAccelerations[i]*DT);
+    }
+    for (i = 1; i < 2*POINT_COUNT; i += 2) { // y-coords
+        pointCoords[i] += pointVelocities[i]*DT + 1/2*pointAccelerations[i]*DT*DT;
+        oldpointAccelerations[i]=pointAccelerations[i];
+        updateAccelerations();
+        pointVelocities[i] += 1/2*(oldpointAccelerations[i]*DT+pointAccelerations[i]*DT);
+    }
+}
+
+function integrateRK4(deltaTime){
+    let DT = deltaTime;
+  
+    let i;
+    
+  let xKv1,xKv2,xKv3,xKv4; //Son aceleraciones
+  let xKx1,xKx2,xKx3,xKx4; //Son velocidades
+  let xK2,xK3,xK4; //Son las posiciones estimadas para evaluar la aceleracion
+
+  let yKv1,yKv2,yKv3,yKv4; //Son aceleraciones
+  let yKx1,yKx2,yKx3,yKx4; //Son velocidades
+  let yK2,yK3,yK4; //Son las posiciones estimadas para evaluar la aceleracion
+  
+    for (i = 0; i < 2*POINT_COUNT; i += 2) { // x-coords
+        oldpointCoords[i] = pointCoords[i];
+        
+        xKv1 = pointAccelerations[i]; 
+        xKx1 = pointVelocities[i]; 
+        
+        xK2 = pointCoords[i] + xKx1*DT/2; 
+        pointCoords[i] = xK2; 
+        updateAccelerations();
+        xKv2 = pointAccelerations[i]; 
+        xKx2 = pointVelocities[i] + xKv1*DT/2; 
+
+        xK3 = pointCoords[i] + xKx2*DT/2; 
+        pointCoords[i] = xK3; 
+        updateAccelerations();
+        xKv3 = pointAccelerations[i];
+        xKx3 = pointVelocities[i] + xKv2*DT/2;
+
+        xK4 = pointCoords[i] + xKx3*DT/2;
+        pointCoords[i] = xK4; 
+        updateAccelerations();
+        xKv4 = pointAccelerations[i];
+        xKx4 = pointVelocities[i] + xKv3*DT/2;
+
+        pointVelocities[i]+= (xKv1+xKv2*2+xKv3*2+xKv4)/6*DT;
+        pointCoords[i] = oldpointCoords[i] + (xKx1+xKx2*2+xKx3*2+xKx4)/6*DT;
+    }
+    for (i = 1; i < 2*POINT_COUNT; i += 2) { // y-coords
+        oldpointCoords[i] = pointCoords[i];
+        
+        yKv1 = pointAccelerations[i];
+        yKx1 = pointVelocities[i];
+        
+        yK2 = pointCoords[i] + yKx1*DT/2;
+        pointCoords[i] = yK2; 
+        updateAccelerations();
+        yKv2 = pointAccelerations[i];
+        yKx2 = pointVelocities[i] + yKv1*DT/2;
+
+        yK3 = pointCoords[i] + yKx2*DT/2;
+        pointCoords[i] = yK3; 
+        updateAccelerations();
+        yKv3 = pointAccelerations[i];
+        yKx3 = pointVelocities[i] + yKv2*DT/2;
+
+        yK4 = pointCoords[i] + yKx3*DT/2;
+        pointCoords[i] = yK4; 
+        updateAccelerations();
+        yKv4 = pointAccelerations[i];
+        yKx4 = pointVelocities[i] + yKv3*DT/2;
+
+        pointVelocities[i] += (yKv1+yKv2*2+yKv3*2+yKv4)/6*DT;
+        pointCoords[i] = oldpointCoords[i] + (yKx1+yKx2*2+yKx3*2+yKx4)/6*DT;
+    }
+    
+}
+
+function updatePointCoordsForFrame(deltaTime) { // called during an animation, before each frame.
+    let DT = 0;
+    
+    if(Number.isNaN(deltaTime)) {
+        DT = 1.0/60.0;
+    }
+    else {
+        DT = deltaTime;
+    }
+
+    
+    console.log("dt  " + deltaTime + "   DT  " + DT);
+    console.log("Before CheckBC:  " + Date.now());
+    CheckBorderBC();
+    console.log("Before CreateGrid:  " + Date.now());
+    createGrid();
+    //console.log("Before CheckCollisions:  " +Date.now());
+    //CheckCollisions();   
+    console.log("Before Integration:  " +Date.now());
+    integrateRK4(DT);
+    console.log("After Integration:  " +Date.now());
+    updateEnergies();
+    console.log("Final:  " +Date.now());
+         
+    
+    
+    
+    
+    
+}
+
+
+/**
+ *  Draws the content of the canvas
+ */
+function draw() {
+
+    gl.clearColor(0.6,0.6,0.6,1);  // specify the color to be used for clearing
+    gl.clear(gl.COLOR_BUFFER_BIT);  // clear the canvas (to black)
+    
+    /* Get options from the user interface. */
+
+    
+    var pointsize = POINT_SIZE;
+    
+    /* Set up values for the "coords" attribute */
+
+    gl.bindBuffer(gl.ARRAY_BUFFER, bufferCoords);
+    gl.bufferData(gl.ARRAY_BUFFER, pointCoords, gl.STREAM_DRAW);
+    gl.vertexAttribPointer(attributeCoords, 2, gl.FLOAT, false, 0, 0);
+    gl.enableVertexAttribArray(attributeCoords); 
+   
+    /* Set up values for the "color" attribute */
+    
+    gl.vertexAttrib3f(attributeColor, 0, 0, 0.8);
+    
+    
+    /* Set the pointsize uniform variable */
+    
+    gl.uniform1f( uniformPointsize, pointsize );
+    
+    /* Draw all the points with one command. */
+   
+    gl.drawArrays(gl.POINTS, 0, POINT_COUNT);
+    
+}
+
+/**
+ * Creates a program for use in the WebGL context gl, and returns the
+ * identifier for that program.  If an error occurs while compiling or
+ * linking the program, an exception of type String is thrown.  The error
+ * string contains the compilation or linking error.  If no error occurs,
+ * the program identifier is the return value of the function.
+ */
+function createProgram(gl, vertexShaderSource, fragmentShaderSource) {
+   var vsh = gl.createShader( gl.VERTEX_SHADER );
+   gl.shaderSource( vsh, vertexShaderSource );
+   gl.compileShader( vsh );
+   if ( ! gl.getShaderParameter(vsh, gl.COMPILE_STATUS) ) {
+      throw "Error in vertex shader:  " + gl.getShaderInfoLog(vsh);
+   }
+   var fsh = gl.createShader( gl.FRAGMENT_SHADER );
+   gl.shaderSource( fsh, fragmentShaderSource );
+   gl.compileShader( fsh );
+   if ( ! gl.getShaderParameter(fsh, gl.COMPILE_STATUS) ) {
+      throw "Error in fragment shader:  " + gl.getShaderInfoLog(fsh);
+   }
+   var prog = gl.createProgram();
+   gl.attachShader( prog, vsh );
+   gl.attachShader( prog, fsh );
+   gl.linkProgram( prog );
+   if ( ! gl.getProgramParameter( prog, gl.LINK_STATUS) ) {
+      throw "Link error in program:  " + gl.getProgramInfoLog(prog);
+   }
+   return prog;
+}
+
+/**
+ * Initialize the WebGL graphics context
+ */
+function initGL() {
+    var prog = createProgram( gl, vertexShaderSource, fragmentShaderSource );
+    gl.useProgram(prog);
+    attributeCoords = gl.getAttribLocation(prog, "a_coords");
+    bufferCoords = gl.createBuffer();
+    attributeColor = gl.getAttribLocation(prog, "a_color");
+    bufferColor = gl.createBuffer();
+    uniformHeight = gl.getUniformLocation(prog, "u_height");
+    uniformWidth = gl.getUniformLocation(prog, "u_width");
+    gl.uniform1f(uniformHeight, canvas.height);
+    gl.uniform1f(uniformWidth, canvas.width);
+    uniformPointsize = gl.getUniformLocation(prog, "u_pointsize");
+    createPointData();
+    
+    gl.vertexAttribPointer(attributeColor, 3, gl.FLOAT, false, 0, 0);
+    gl.clearColor(0.6,0.6,0.6,1);  // specify the color to be used for clearing
+    gl.clear(gl.COLOR_BUFFER_BIT);  // clear the canvas (to black)
+}
+
+/*------------ Animation support ------------*/
+
+function doFrame(newTime) {
+        // Convert to seconds
+        let clockseconds = newTime/1000;
+        
+
+        frameRef = requestAnimationFrame(doFrame);
+        
+        frameTime = newTime - currentTime;
+        /*if(currentTime) {
+            
+            // Subtract the previous time from the current time
+            frameTime = newTime - currentTime;
+            if ( frameTime > 250 )
+            frameTime = 250;
+            // Remember the current time for the next frame.
+
+            accumulator += frameTime/1000;
+
+            while ( accumulator >= dt )
+            {
+                console.log("frameRef: " + frameRef + "  newTime:  " + newTime + "   currentTime:   " + currentTime + " frameTime  "  + frameTime  + " FPS  " + 1/frameTime*1000 + "  now: " + Date.now() );
+                updatePointCoordsForFrame(dt);
+                accumulator -= dt;
+
+               
+            }
+
+            var alpha = accumulator / dt;
+            for (let i = 0; i < POINT_COUNT; i++) {
+                pointCoords[2*i] = pointCoords[2*i] * alpha + oldpointCoords[2*i] * (1 - alpha);
+                pointCoords[2*i+1] = pointCoords[2*i+1] * alpha + oldpointCoords[2*i+1] * (1 - alpha);
+            }
+        }*/
+
+        
+        //console.log(pointVelocities[0] + "  " +  pointVelocities[1] );
+        //console.log(pointVelocities[2] + "  " +  pointVelocities[3] );
+        currentTime = newTime;
+        
+        console.log("frameRef: " + frameRef + "  newTime:  " + newTime + "   currentTime:   " + currentTime + " frameTime  "  + frameTime + " FPS  " + 1/frameTime*1000 + "  now: " + Date.now() );
+        
+        updatePointCoordsForFrame(frameTime/1000);
+        
+        draw();
+              
+    
+    
+        
+    
+        var out=document.getElementById("output1");
+        out.innerHTML="Potential Energy Y of Particle Nr(1)   :" + pointPotentialEnergy[1]; 
+        var out2=document.getElementById("output2");
+        out2.innerHTML="Elapsed time   :" + clockseconds ; 
+        var outcollision=document.getElementById("output4");
+        outcollision.innerHTML="COLLISIONS: " + COLLISIONS; 
+        var out3=document.getElementById("output5");
+        out3.innerHTML="FPS   :" + Math.round(1/frameTime*1000); 
+        
+        
+              
+
+}
+
+
+function startAnimation() {
+    if (!running){
+        running = true;
+        doFrame();
+    }    
+        
+}
+
+function stopAnimation() {
+    
+    if (running){
+        running = false;
+        cancelAnimationFrame(frameRef);
+    }  
+    
+
+}
+
+document.addEventListener('keydown', (event) => {
+  const keyName = event.key;
+  if (keyName == " ") {
+      if (!running) {
+          startAnimation();
+      } 
+      else {
+          stopAnimation();
+      } 
+  }
+});
+
+/*-------------------------------------------*/
+
+/**
+ * Initialize the program.  This function is called after the page has been loaded.
+ */
+function init() {
+    try {
+        canvas = document.getElementById("webglcanvas");
+        var options = {  // no need for alpha channel or depth buffer in this program
+            alpha: false,
+            depth: false
+        };
+        gl = canvas.getContext("webgl", options) || 
+                         canvas.getContext("experimental-webgl", options);
+        if ( ! gl ) {
+            throw "Browser does not support WebGL";
+        }
+    }
+    catch (e) {
+        document.getElementById("canvas-holder").innerHTML =
+            "<p>Sorry, could not get a WebGL graphics context.</p>";
+        return;
+    }
+    try {
+        initGL();  // initialize the WebGL graphics context
+    }
+    catch (e) {
+        document.getElementById("canvas-holder").innerHTML =
+            "<p>Sorry, could not initialize the WebGL graphics context:" + e + "</p>";
+        return;
+    }
+    
+    
+}
+
+</script>
+</head>
+<body onload="init()">
+
+<h2>Moving Points with the WebGL POINTS primitive</h2>
+
+<noscript><p><b>Sorry, but this page requires JavaScript.</b></p></noscript>
+
+
+
+<div id="canvas-holder">
+<canvas id="webglcanvas" width="800" height="600"></canvas>
+<p></p>
+<button onClick="startAnimation()">Start Animation</button><button onClick="stopAnimation()">Stop Animation</button>
+<p id="output1"></p>
+<p id="output2"></p>
+<p id="output3"></p>
+<p id="output4"></p>
+<p id="output5"></p>
+</div>
+
+</body>
+</html>
